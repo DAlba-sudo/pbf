@@ -1,6 +1,7 @@
 package pbf
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"log/slog"
@@ -10,15 +11,19 @@ import (
 
 var (
 	logger = slog.New(slog.NewJSONHandler(log.Writer(), nil))
+
+	ErrSkipHandler = errors.New("mw asks to skip handler")
 )
 
 type Handler func(http.ResponseWriter, *http.Request) error
 
 type Router struct {
-	Address string
-	Port    int
-	mux     *http.ServeMux
+	Address         string
+	Port            int
+	CertificateFile string
+	KeyFile         string
 
+	mux        *http.ServeMux
 	middleware []Handler
 	routes     map[string](map[string]Handler)
 }
@@ -28,6 +33,10 @@ type RouteOptions struct {
 	Method   string
 
 	Handler Handler
+}
+
+func (r *Router) Mux() *http.ServeMux {
+	return r.mux
 }
 
 func (r *Router) Add(opt RouteOptions) {
@@ -60,12 +69,16 @@ func cleanPath(path string) string {
 	return p
 }
 
-func (r Router) Runner(w http.ResponseWriter, req *http.Request) {
+func (r *Router) Runner(w http.ResponseWriter, req *http.Request) {
 	path := cleanPath(req.URL.Path)
 
 	for _, mw := range r.middleware {
 		err := mw(w, req)
 		if err != nil {
+			if err == ErrSkipHandler {
+				logger.Info("skipping handler as requested by middleware", "path", path)
+			}
+
 			logger.Error("middleware error", "path", path, "error", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -83,6 +96,7 @@ func (r Router) Runner(w http.ResponseWriter, req *http.Request) {
 	if !ok {
 		logger.Warn("method not allowed", "path", path, "method", req.Method)
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
 	}
 
 	err := handler(w, req)
@@ -95,5 +109,10 @@ func (r Router) Runner(w http.ResponseWriter, req *http.Request) {
 func (r *Router) Start() error {
 	logger.Info("starting router", "address", r.Address, "port", r.Port)
 
-	return http.ListenAndServe(fmt.Sprintf("%s:%d", r.Address, r.Port), r.mux)
+	if r.CertificateFile == "" || r.KeyFile == "" {
+		logger.Info("starting router without TLS")
+		return http.ListenAndServe(fmt.Sprintf("%s:%d", r.Address, r.Port), r.mux)
+	}
+	logger.Info("starting router with TLS", "certificate_file", r.CertificateFile, "key_file", r.KeyFile)
+	return http.ListenAndServeTLS(fmt.Sprintf("%s:%d", r.Address, r.Port), r.CertificateFile, r.KeyFile, r.mux)
 }
